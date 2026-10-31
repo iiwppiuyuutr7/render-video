@@ -1,0 +1,192 @@
+name: Render video
+
+# Cara pakai: upload zip proyek (Root.tsx + komponen + public/audio.mp3) ke repo ini (folder paling luar),
+# lalu tab Actions -> "Render video" -> Run workflow -> isi nama zip, pilih resolusi dan fps.
+# Hasil: file MP4 di halaman Releases (atau di Artifacts kalau opsi release dimatikan).
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip:
+        description: 'Nama file zip yang sudah diupload ke repo (contoh: waktu-remotion-audio.zip)'
+        required: true
+        type: string
+      height:
+        description: 'Resolusi (sisi pendek)'
+        required: true
+        type: choice
+        default: '1080'
+        options: ['1080', '720']
+      fps:
+        description: 'FPS'
+        required: true
+        type: choice
+        default: '60'
+        options: ['60', '30']
+      release:
+        description: 'Simpan hasil ke Releases (unduh MP4 langsung). Matikan = simpan di Artifacts.'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  render:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      ZIP: ${{ inputs.zip }}
+      HEIGHT: ${{ inputs.height }}
+      FPS: ${{ inputs.fps }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Library sistem untuk Chrome
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends libnss3 libdbus-1-3 libatk1.0-0t64 libatk-bridge2.0-0t64 libasound2t64 libxrandr2 libxkbcommon0 libxfixes3 libxcomposite1 libxdamage1 libgbm1 libcups2t64 libpangocairo-1.0-0 libxshmfence1 || true
+
+      - name: Siapkan proyek dari zip
+        run: |
+          test -f "$ZIP" || { echo "File $ZIP tidak ada di repo. Isi repo:"; ls -la; exit 1; }
+          mkdir -p work/src work/public work/_unz
+          unzip -q -o "$ZIP" -d work/_unz
+          cat > work/package.json <<'EOF'
+          {
+            "name": "render",
+            "private": true,
+            "type": "module",
+            "dependencies": {
+              "@remotion/bundler": "^4.0.0",
+              "@remotion/google-fonts": "^4.0.0",
+              "@remotion/renderer": "^4.0.0",
+              "react": "^19.0.0",
+              "react-dom": "^19.0.0",
+              "remotion": "^4.0.0"
+            }
+          }
+          EOF
+          cat > work/prepare.mjs <<'EOF'
+          import {readdirSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, existsSync} from 'node:fs';
+          import path from 'node:path';
+          const [src, dst] = process.argv.slice(2);
+          const CODE = new Set(['.tsx', '.ts', '.jsx', '.js', '.css', '.json']);
+          const MEDIA = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg', '.mp3', '.wav', '.m4a', '.aac', '.mp4', '.mov', '.webm', '.woff', '.woff2', '.ttf', '.otf']);
+          const walk = (d) =>
+            readdirSync(d, {withFileTypes: true}).flatMap((e) =>
+              e.isDirectory() ? (['__MACOSX', 'node_modules'].includes(e.name) ? [] : walk(path.join(d, e.name))) : [path.join(d, e.name)],
+            );
+          const files = walk(src).filter((f) => !path.basename(f).startsWith('.'));
+          const parts = files.map((f) => path.relative(src, f).split(path.sep));
+          const strip = parts.length && parts.every((p) => p.length > 1 && p[0] === parts[0][0]) ? 1 : 0;
+          let n = 0;
+          files.forEach((f, i) => {
+            const rel = parts[i].slice(strip).join('/');
+            const ext = path.extname(rel).toLowerCase();
+            const prefixed = rel.startsWith('src/') || rel.startsWith('public/');
+            const top = prefixed ? '' : CODE.has(ext) ? 'src/' : MEDIA.has(ext) ? 'public/' : null;
+            if (top === null) return;
+            const target = path.join(dst, top + rel);
+            mkdirSync(path.dirname(target), {recursive: true});
+            copyFileSync(f, target);
+            n++;
+          });
+          const s = path.join(dst, 'src');
+          let entry = ['index.ts', 'index.tsx', 'index.js', 'index.jsx'].find((x) => existsSync(path.join(s, x)));
+          if (!entry) {
+            const rf = ['Root.tsx', 'Root.jsx', 'Root.ts', 'Root.js'].find((x) => existsSync(path.join(s, x)));
+            if (!rf) throw new Error('Nggak nemu Root.tsx di dalam zip');
+            const code = readFileSync(path.join(s, rf), 'utf8');
+            const base = rf.replace(/\.[jt]sx?$/, '');
+            let imp, name;
+            if (/export\s+default/.test(code)) {
+              imp = `import Root from './${base}';`;
+              name = 'Root';
+            } else {
+              const m = code.match(/export\s+(?:const|function|class)\s+(\w+)/);
+              if (!m) throw new Error('Root.tsx harus meng-export komponen Root');
+              name = m[1];
+              imp = `import {${name}} from './${base}';`;
+            }
+            entry = 'index.ts';
+            writeFileSync(path.join(s, entry), `import {registerRoot} from 'remotion';\n${imp}\nregisterRoot(${name});\n`);
+          }
+          console.log(`Disiapkan ${n} file, entry: src/${entry}`);
+          EOF
+          cat > work/render.mjs <<'EOF'
+          import path from 'node:path';
+          import {mkdirSync} from 'node:fs';
+          import {bundle} from '@remotion/bundler';
+          import {getCompositions, selectComposition, renderMedia} from '@remotion/renderer';
+          const [entry, publicDir, outFile, hArg, fArg] = process.argv.slice(2);
+          const targetHeight = Number(hArg);
+          const fps = Number(fArg);
+          mkdirSync(path.dirname(path.resolve(outFile)), {recursive: true});
+          const serveUrl = await bundle({entryPoint: path.resolve(entry), publicDir: path.resolve(publicDir)});
+          const comps = await getCompositions(serveUrl, {inputProps: {}});
+          if (!comps.length) throw new Error('Nggak ada <Composition>');
+          const composition = await selectComposition({serveUrl, id: comps[0].id, inputProps: {}});
+          console.log(`COMPOSITION ${composition.id} ${composition.width}x${composition.height} ${composition.fps}fps ${composition.durationInFrames}f`);
+          // skala dari ukuran desain; lebar dan tinggi hasil selalu bilangan bulat
+          const gcd = (a, b) => (b ? gcd(b, a % b) : a);
+          const g = gcd(composition.width, composition.height);
+          const short = Math.min(composition.width, composition.height);
+          const k = Math.max(1, Math.round((targetHeight * g) / short));
+          const scale = k / g;
+          const durationInFrames = Math.max(1, Math.round((composition.durationInFrames * fps) / composition.fps));
+          let last = -1;
+          // encoding: murni default Remotion (H.264, CRF, preset, audio), tanpa pengaturan kualitas kustom
+          await renderMedia({
+            serveUrl,
+            composition: {...composition, fps, durationInFrames},
+            codec: 'h264',
+            outputLocation: path.resolve(outFile),
+            scale,
+            onProgress: ({progress}) => {
+              const pct = Math.floor(progress * 100);
+              if (pct >= last + 10) {
+                last = pct;
+                console.log(`PROGRESS ${pct}%`);
+              }
+            },
+          });
+          console.log('DONE');
+          EOF
+          node work/prepare.mjs work/_unz work
+          echo "Isi proyek:"; find work/src work/public -type f | head -50
+
+      - name: Pasang Remotion
+        working-directory: work
+        run: npm install --no-audit --no-fund --no-progress
+
+      - name: Render
+        working-directory: work
+        run: |
+          NAME="${ZIP%.zip}-${HEIGHT}p${FPS}fps"
+          echo "NAME=$NAME" >> "$GITHUB_ENV"
+          node render.mjs src/index.ts public "out/$NAME.mp4" "$HEIGHT" "$FPS"
+          ls -la out
+          free -m || true
+
+      - name: Simpan ke Releases
+        if: ${{ inputs.release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "video-${{ github.run_number }}" "work/out/$NAME.mp4" \
+            --title "$NAME" --notes "Dirender dari $ZIP ($HEIGHT p, $FPS fps)."
+
+      - name: Simpan ke Artifacts
+        if: ${{ !inputs.release }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: work/out/${{ env.NAME }}.mp4
+          compression-level: 0
+          retention-days: 7
