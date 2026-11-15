@@ -1,30 +1,68 @@
 name: Render video
 
-# Cara pakai: upload zip proyek (Root.tsx + komponen + public/audio.mp3) ke repo ini (folder paling luar),
-# lalu tab Actions -> "Render video" -> Run workflow -> isi nama zip, pilih resolusi dan fps.
-# Hasil: file MP4 di halaman Releases (atau di Artifacts kalau opsi release dimatikan).
+# Cara pakai:
+#   1. Upload zip proyek (Root.tsx + komponen + folder public/ berisi audio/klip) ke repo ini (folder paling luar).
+#   2. Tab Actions -> "Render video" -> Run workflow -> isi nama zip, pilih pengaturan (default sudah kualitas tertinggi).
+#   3. Hasil: file MP4 (atau MOV kalau pilih ProRes) di halaman Releases, atau di Artifacts kalau opsi release dimatikan
+#      / file di atas 1,9 GB (batas GitHub Releases 2 GB).
+#
+# Prinsip kualitas (supaya hasil sama bagusnya dengan render di komputer sendiri):
+#   - Frame antara dirender sebagai PNG (lossless). Default Remotion memakai JPEG kualitas 80, yang sudah menurunkan
+#     kualitas SEBELUM video di-encode.
+#   - CRF rendah (default 12; makin kecil makin tajam, 1 = hampir lossless tapi file raksasa), preset "slow".
+#   - Audio AAC 320 kbps, color space BT.709.
+#   - Resolusi dan FPS default "asli" = persis seperti desain proyek, tidak diskalakan / dikonversi.
+#   - Tidak ada re-encode setelah render: file yang diunggah = file keluaran Remotion apa adanya.
 
 on:
   workflow_dispatch:
     inputs:
       zip:
-        description: 'Nama file zip yang sudah diupload ke repo (contoh: waktu-remotion-audio.zip)'
+        description: 'Nama file zip yang sudah diupload ke repo (contoh: gedung-remotion.zip)'
         required: true
         type: string
       height:
-        description: 'Resolusi (sisi pendek)'
+        description: 'Resolusi sisi pendek (asli = ukuran desain proyek, tanpa skala)'
         required: true
         type: choice
-        default: '1080'
-        options: ['1080', '720']
+        default: 'asli'
+        options: ['asli', '720', '1080', '1440', '2160']
       fps:
-        description: 'FPS'
+        description: 'FPS (asli = FPS desain proyek). Jangan ubah kecuali proyeknya memang dibuat untuk itu.'
         required: true
         type: choice
-        default: '60'
-        options: ['60', '30']
+        default: 'asli'
+        options: ['asli', '24', '30', '60']
+      codec:
+        description: 'Format keluaran (h264 = MP4 siap upload; prores = MOV hampir tanpa kompresi, file sangat besar)'
+        required: true
+        type: choice
+        default: 'h264'
+        options: ['h264', 'prores']
+      crf:
+        description: 'Kualitas H.264 (CRF, makin kecil makin bagus & makin besar file). Diabaikan kalau ProRes.'
+        required: true
+        type: choice
+        default: '12'
+        options: ['1', '8', '12', '16', '18']
+      preset:
+        description: 'Preset encoder H.264 (lebih lambat = file lebih kecil di kualitas yang sama)'
+        required: true
+        type: choice
+        default: 'slow'
+        options: ['medium', 'slow', 'slower', 'veryslow']
+      composition:
+        description: 'ID composition (kosongkan = composition pertama)'
+        required: false
+        type: string
+        default: ''
+      remotion_version:
+        description: 'Versi Remotion, contoh 4.0.300 (kosongkan = versi terbaru; semua paket Remotion otomatis disamakan)'
+        required: false
+        type: string
+        default: ''
       release:
-        description: 'Simpan hasil ke Releases (unduh MP4 langsung). Matikan = simpan di Artifacts.'
+        description: 'Simpan hasil ke Releases (unduh langsung). Matikan = simpan di Artifacts (7 hari).'
         required: true
         type: boolean
         default: true
@@ -35,11 +73,16 @@ permissions:
 jobs:
   render:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 300
     env:
       ZIP: ${{ inputs.zip }}
       HEIGHT: ${{ inputs.height }}
       FPS: ${{ inputs.fps }}
+      CODEC: ${{ inputs.codec }}
+      CRF: ${{ inputs.crf }}
+      PRESET: ${{ inputs.preset }}
+      COMP: ${{ inputs.composition }}
+      RV_INPUT: ${{ inputs.remotion_version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -63,12 +106,13 @@ jobs:
             "private": true,
             "type": "module",
             "dependencies": {
-              "@remotion/bundler": "^4.0.0",
-              "@remotion/google-fonts": "^4.0.0",
-              "@remotion/renderer": "^4.0.0",
+              "@remotion/bundler": "__RV__",
+              "@remotion/cli": "__RV__",
+              "@remotion/google-fonts": "__RV__",
+              "@remotion/renderer": "__RV__",
               "react": "^19.0.0",
               "react-dom": "^19.0.0",
-              "remotion": "^4.0.0"
+              "remotion": "__RV__"
             }
           }
           EOF
@@ -121,72 +165,117 @@ jobs:
           EOF
           cat > work/render.mjs <<'EOF'
           import path from 'node:path';
-          import {mkdirSync} from 'node:fs';
+          import {mkdirSync, statSync, appendFileSync} from 'node:fs';
           import {bundle} from '@remotion/bundler';
           import {getCompositions, selectComposition, renderMedia} from '@remotion/renderer';
-          const [entry, publicDir, outFile, hArg, fArg] = process.argv.slice(2);
-          const targetHeight = Number(hArg);
-          const fps = Number(fArg);
+          const [entry, publicDir, outFile] = process.argv.slice(2);
+          const {HEIGHT, FPS, CODEC, CRF, PRESET, COMP} = process.env;
           mkdirSync(path.dirname(path.resolve(outFile)), {recursive: true});
           const serveUrl = await bundle({entryPoint: path.resolve(entry), publicDir: path.resolve(publicDir)});
           const comps = await getCompositions(serveUrl, {inputProps: {}});
           if (!comps.length) throw new Error('Nggak ada <Composition>');
-          const composition = await selectComposition({serveUrl, id: comps[0].id, inputProps: {}});
+          const id = COMP && comps.some((c) => c.id === COMP) ? COMP : comps[0].id;
+          if (COMP && id !== COMP) console.log(`Composition "${COMP}" tidak ada (${comps.map((c) => c.id).join(', ')}), pakai "${id}"`);
+          const composition = await selectComposition({serveUrl, id, inputProps: {}});
           console.log(`COMPOSITION ${composition.id} ${composition.width}x${composition.height} ${composition.fps}fps ${composition.durationInFrames}f`);
-          // skala dari ukuran desain; lebar dan tinggi hasil selalu bilangan bulat
-          const gcd = (a, b) => (b ? gcd(b, a % b) : a);
-          const g = gcd(composition.width, composition.height);
-          const short = Math.min(composition.width, composition.height);
-          const k = Math.max(1, Math.round((targetHeight * g) / short));
-          const scale = k / g;
+
+          // Resolusi: "asli" = skala 1 (tanpa perubahan). Selain itu skala dari ukuran desain, lebar & tinggi hasil bulat dan genap.
+          let scale = 1;
+          if (HEIGHT !== 'asli') {
+            const gcd = (a, b) => (b ? gcd(b, a % b) : a);
+            const g = gcd(composition.width, composition.height);
+            const short = Math.min(composition.width, composition.height);
+            const k = Math.max(1, Math.round((Number(HEIGHT) * g) / short));
+            scale = k / g;
+          }
+          // FPS: "asli" = FPS desain. Kalau diganti, durasi (jumlah frame) disesuaikan supaya lamanya sama.
+          const fps = FPS === 'asli' ? composition.fps : Number(FPS);
+          if (fps !== composition.fps) {
+            console.log(`PERINGATAN: FPS diubah ${composition.fps} -> ${fps}. Proyek yang menghitung waktu dari konstanta FPS akan jadi tidak sinkron dengan audio.`);
+          }
           const durationInFrames = Math.max(1, Math.round((composition.durationInFrames * fps) / composition.fps));
+
+          const prores = CODEC === 'prores';
           let last = -1;
-          // encoding: murni default Remotion (H.264, CRF, preset, audio), tanpa pengaturan kualitas kustom
           await renderMedia({
             serveUrl,
             composition: {...composition, fps, durationInFrames},
-            codec: 'h264',
+            codec: prores ? 'prores' : 'h264',
             outputLocation: path.resolve(outFile),
             scale,
+            // kualitas: frame PNG (lossless), BT.709, audio 320 kbps, tanpa pengaturan bitrate yang membatasi
+            imageFormat: 'png',
+            colorSpace: 'bt709',
+            audioBitrate: '320k',
+            ...(prores ? {proResProfile: '4444'} : {crf: Number(CRF), x264Preset: PRESET, pixelFormat: 'yuv420p'}),
             onProgress: ({progress}) => {
               const pct = Math.floor(progress * 100);
-              if (pct >= last + 10) {
+              if (pct >= last + 5) {
                 last = pct;
                 console.log(`PROGRESS ${pct}%`);
               }
             },
           });
+          const bytes = statSync(path.resolve(outFile)).size;
+          const seconds = durationInFrames / fps;
+          const info = [
+            `### Hasil render`,
+            `- Composition: \`${composition.id}\``,
+            `- Ukuran video: ${Math.round(composition.width * scale)}x${Math.round(composition.height * scale)} @ ${fps} fps, ${seconds.toFixed(1)} detik`,
+            `- Format: ${prores ? 'ProRes 4444 (MOV)' : `H.264 CRF ${CRF}, preset ${PRESET} (MP4)`}`,
+            `- Ukuran file: ${(bytes / 1048576).toFixed(1)} MB (rata-rata ${Math.round((bytes * 8) / seconds / 1000)} kbps)`,
+          ].join('\n');
+          console.log(info);
+          if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, info + '\n');
           console.log('DONE');
           EOF
           node work/prepare.mjs work/_unz work
           echo "Isi proyek:"; find work/src work/public -type f | head -50
 
-      - name: Pasang Remotion
+      - name: Pasang Remotion (semua paket satu versi)
         working-directory: work
-        run: npm install --no-audit --no-fund --no-progress
+        run: |
+          RV="$RV_INPUT"
+          if [[ ! "$RV" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then RV="$(npm view remotion version)"; fi
+          echo "Remotion $RV"
+          echo "RV=$RV" >> "$GITHUB_ENV"
+          sed -i "s/__RV__/$RV/g" package.json
+          npm install --no-audit --no-fund --no-progress
 
       - name: Render
         working-directory: work
         run: |
-          NAME="${ZIP%.zip}-${HEIGHT}p${FPS}fps"
+          if [ "$CODEC" = "prores" ]; then EXT=mov; else EXT=mp4; fi
+          RES="$HEIGHT"; [ "$RES" = "asli" ] || RES="${RES}p"
+          NAME="${ZIP%.zip}-${RES}-${FPS}fps"
+          [ "$CODEC" = "prores" ] && NAME="${NAME}-prores" || NAME="${NAME}-crf${CRF}"
           echo "NAME=$NAME" >> "$GITHUB_ENV"
-          node render.mjs src/index.ts public "out/$NAME.mp4" "$HEIGHT" "$FPS"
+          echo "EXT=$EXT" >> "$GITHUB_ENV"
+          node render.mjs src/index.ts public "out/$NAME.$EXT"
           ls -la out
           free -m || true
 
+      - name: Cek hasil (ffprobe) dan ukuran
+        working-directory: work
+        run: |
+          npx remotion ffprobe "out/$NAME.$EXT" 2>&1 | grep -E "Stream|Duration|Input" || true
+          SIZE=$(stat -c%s "out/$NAME.$EXT")
+          echo "Ukuran file: $SIZE byte"
+          if [ "$SIZE" -gt 1900000000 ]; then echo "TOO_BIG=true" >> "$GITHUB_ENV"; echo "File di atas 1,9 GB -> disimpan di Artifacts (batas Releases 2 GB)."; fi
+
       - name: Simpan ke Releases
-        if: ${{ inputs.release }}
+        if: ${{ inputs.release && env.TOO_BIG != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "video-${{ github.run_number }}" "work/out/$NAME.mp4" \
-            --title "$NAME" --notes "Dirender dari $ZIP ($HEIGHT p, $FPS fps)."
+          gh release create "video-${{ github.run_number }}" "work/out/$NAME.$EXT" \
+            --title "$NAME" --notes "Dirender dari $ZIP (${HEIGHT}, ${FPS} fps, ${CODEC}, CRF ${CRF}, Remotion ${RV})."
 
       - name: Simpan ke Artifacts
-        if: ${{ !inputs.release }}
+        if: ${{ !inputs.release || env.TOO_BIG == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.NAME }}
-          path: work/out/${{ env.NAME }}.mp4
+          path: work/out/${{ env.NAME }}.${{ env.EXT }}
           compression-level: 0
           retention-days: 7
