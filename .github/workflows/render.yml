@@ -66,6 +66,11 @@ on:
         required: true
         type: boolean
         default: true
+      chat_id:
+        description: 'ID chat Telegram buat notifikasi (diisi otomatis oleh bot, kosongkan kalau manual)'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: write
@@ -279,3 +284,26 @@ jobs:
           path: work/out/${{ env.NAME }}.${{ env.EXT }}
           compression-level: 0
           retention-days: 7
+
+      - name: Kabari Telegram
+        if: ${{ always() && inputs.chat_id != '' }}
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ inputs.chat_id }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REL_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/video-${{ github.run_number }}
+          RELEASE: ${{ inputs.release }}
+        run: |
+          API="https://api.telegram.org/bot${TG_TOKEN}"
+          FILE="work/out/${NAME}.${EXT}"
+          if [ "$JOB_STATUS" != "success" ]; then
+            curl -sS "$API/sendMessage" -d chat_id="$CHAT_ID" --data-urlencode text="Render GAGAL ($ZIP). Log: $RUN_URL" >/dev/null; exit 0
+          fi
+          SIZE=$(stat -c%s "$FILE")
+          if [ "$SIZE" -le 50000000 ]; then
+            curl -sS "$API/sendDocument" -F chat_id="$CHAT_ID" -F document=@"$FILE" -F caption="Render selesai: $NAME ($((SIZE/1048576)) MB)" | grep -o '"ok":[a-z]*'
+          else
+            LINK="$RUN_URL"; [ "$RELEASE" = "true" ] && [ "${TOO_BIG:-}" != "true" ] && LINK="$REL_URL"
+            curl -sS "$API/sendMessage" -d chat_id="$CHAT_ID" --data-urlencode text="Render selesai: $NAME ($((SIZE/1048576)) MB, terlalu besar buat Telegram). Unduh: $LINK" >/dev/null
+          fi
